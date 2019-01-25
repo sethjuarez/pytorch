@@ -5,7 +5,7 @@
 
 namespace torch {
 namespace jit {
-class AliasSetTracker;
+class AliasTracker;
 
 /**
  * Alias analysis pass.
@@ -116,7 +116,7 @@ class AliasDb {
   std::shared_ptr<Graph> graph_;
   std::unordered_map<const Graph*, const Node*> subgraphToOwner_;
   std::unordered_set<const Node*> wildcardNodes_;
-  std::unique_ptr<AliasSetTracker> setTracker_;
+  std::unique_ptr<AliasTracker> aliasTracker_;
 };
 } // namespace jit
 } // namespace torch

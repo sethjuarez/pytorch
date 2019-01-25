@@ -2,6 +2,7 @@
 
 #include <torch/csrc/jit/script/error_report.h>
 #include <torch/csrc/utils/memory.h>
+#include <queue>
 
 namespace torch {
 namespace jit {
@@ -22,323 +23,303 @@ bool shouldAnnotate(const Value* v) {
 }
 } // namespace
 
-// A union find-ish way to track values and the alias sets they belong to.
+// class AliasTracker
 //
-// Being a member of an alias set means that the value *may* alias any value in
-// the set.
+// This class tracks the "A points to B" graph for all values, as well as
+// wildcards and writes. It is used by AliasDb to provide a higher-level API.
 //
-// Values can belong in more than one alias set. This can happen if, e.g. it
-// takes on two different aliases depending on branching control flow.
-class AliasSetTracker {
+// NOTE: this implementation is not very efficient; it's designed to be easy to
+// mutate as you modify the graph.
+class AliasTracker {
  public:
   // Returns true iff `v` is present in the alias set tracker.
   bool contains(const Value* v) const {
     return map_.count(v);
   }
 
-  // Whether `a` *may be* an alias of `b`
-  bool isAlias(const Value* a, const Value* b) const {
+  bool writesTo(Node* n, const Value* v) const {
+    if (isWildcard(v)) {
+      return wildcardWriters_.count(n);
+    }
+
+    if (!map_.count(v)) {
+      return false;
+    }
+
+    return map_.at(v)->writers.count(n);
+  }
+
+  // Whether `a` *may* point to `b`
+  bool pointsTo(const Value* a, const Value* b) const {
+    if (!map_.count(a)) {
+      return false;
+    }
     if (isWildcard(a) || isWildcard(b)) {
       return true;
     }
-    const auto& aSets = map_.at(a);
-    const auto& bSets = map_.at(b);
-    for (auto aElement : aSets) {
-      for (auto bElement : bSets) {
-        if (isSameSet(aElement, bElement)) {
-          return true;
-        }
-      }
-    }
-    return false;
+
+    // BFS the subtree where the root is `a`s element and the branches are the
+    // `pointsTo` relationships.
+    const auto root = map_.at(a);
+    return root->bfs(
+        [&](const Element* el) { return el->value == b; },
+        BfsDirection::POINTS_TO,
+        /*shortCircuit=*/true);
   }
 
-  // Register `v` as a member of the wildcard set.
+  // Make `v` point at `to`.
+  //
+  // Returns true if this actually changed the AliasTracker state (i.e. if
+  // we've never heard about this relationship before)
+  bool makeAlias(const Value* v, const Value* to) {
+    if (v == to) {
+      return false;
+    }
+
+    // If `to` is a wildcard, don't insert anything into the graph; wildcards
+    // are tracked separately since they have different aliasing rules.
+    if (isWildcard(to)) {
+      if (isWildcard(v)) {
+        return false;
+      } else {
+        setWildcard(v);
+        return true;
+      }
+    }
+
+    if (!map_.count(to)) {
+      makeFreshAlias(to);
+    }
+
+    if (!map_.count(v)) {
+      makeFreshAlias(v);
+    }
+
+    auto vEl = map_.at(v);
+    auto toEl = map_.at(to);
+
+    if (vEl->pointsTo.count(toEl)) {
+      AT_ASSERT(toEl->pointedFrom.count(vEl));
+      return false;
+    }
+
+    vEl->pointsTo.insert(toEl);
+    toEl->pointedFrom.insert(vEl);
+
+    return true;
+  }
+
+  // Give `v` a fresh alias (i.e. it does not point to any value)
+  void makeFreshAlias(const Value* v) {
+    auto el = torch::make_unique<Element>();
+    el->value = v;
+
+    auto rawPtr = el.get();
+    elements_.emplace(rawPtr, std::move(el));
+    map_.emplace(v, rawPtr);
+  }
+
+  // Register `v` as a wildcard value.
   void setWildcard(const Value* v) {
+    wildcards_.insert(v);
+  }
+
+  // is `v` a wildcard?
+  bool isWildcard(const Value* v) const {
+    return wildcards_.count(v);
+  }
+
+  // Register the fact that `n` writes to `v`.
+  void registerWrite(const Value* v, Node* n) {
+    numWrites_++;
+
     if (isWildcard(v)) {
+      wildcardWriters_.insert(n);
       return;
     }
 
-    if (wildcardSet_) {
-      registerMembership(v, wildcardSet_);
-    } else {
-      wildcardSet_ = makeSet(v);
-      map_.insert({v, {wildcardSet_}});
-    }
+    AT_ASSERT(map_.count(v));
+    map_.at(v)->writers.insert(n);
   }
 
-  // Returns whether `v` is a wildcard.
-  bool isWildcard(const Value* v) const {
-    if (!contains(v)) {
-      // This value is not tracked
-      return false;
-    }
-
-    if (!wildcardSet_) {
-      // Wildcard set is empty
-      return false;
-    }
-
-    const auto& sets = map_.at(v);
-    return std::any_of(sets.begin(), sets.end(), [&](Element* set) {
-      return isSameSet(set, wildcardSet_);
-    });
-  }
-
-  // Give `v` a "fresh" alias set (i.e. it does not alias any other value).
-  void makeFreshAlias(const Value* v) {
-    auto set = makeSet(v);
-    map_.insert({v, {set}});
-  }
-
-  // Make `a` and alias of `b`, by making `a` a member of all of `b`'s alias
-  // sets.
-  //
-  // Returns true if a change occured to a's alias set
-  bool makeAlias(const Value* a, const Value* b) {
-    if (!map_.count(b)) {
-      makeFreshAlias(b);
-    }
-
-    bool changed = false;
-    for (const auto& set : map_.at(b)) {
-      const bool aHasSet = map_.count(a) && map_.at(a).count(set);
-      if (!aHasSet) {
-        changed = true;
-        registerMembership(a, set);
-      }
-    }
-    return changed;
-  }
-
-  // Get all values that may alias to `v`.
-  // NOTE: This does not include wildcards.
+  // Return all aliases of `v`. This is the full set of any other value that
+  // *may* represent the same memory location.
+  // NOTE: this does not consider wildcard values
   std::unordered_set<const Value*> getAliases(const Value* v) const {
-    std::unordered_set<const Value*> aliases;
-    // Collect all aliases in all sets that `v` may have membership in.
-    for (auto set : map_.at(v)) {
-      auto cur = set;
-      auto end = cur;
-
-      // Traverse the next-list and find all the values.
-      // Insert the first element
-      aliases.insert(cur->value);
-      cur = cur->next;
-
-      while (cur != end) {
-        aliases.insert(cur->value);
-        cur = cur->next;
-      }
+    std::unordered_set<const Value*> ret;
+    if (!map_.count(v)) {
+      return ret;
     }
 
-    return aliases;
+    const auto root = map_.at(v);
+
+    root->bfsBothDirections([&](const Element* el) {
+      ret.insert(el->value);
+      return false; // fn has to return bool but we don't use the result
+    });
+    return ret;
   }
 
-  void registerWrite(const Value* v, Node* writer) {
-    for (auto set : map_.at(v)) {
-      const auto root = find(set);
-      writes_[root].insert(writer);
-    }
-  }
-
-  const std::unordered_set<Node*>& getWildcardWriters() const {
-    // Static so we can always return without a copy.
-    static std::unordered_set<Node*> empty;
-    if (!wildcardSet_) {
-      return empty;
-    }
-
-    if (!writes_.count(find(wildcardSet_))) {
-      return empty;
-    }
-
-    return writes_.at(find(wildcardSet_));
-  }
-
-  // NOTE: this does not include writes to the wildcard.
+  // Get all nodes that write to `v` or a value that may alias `v`.
   std::unordered_set<Node*> getWrites(const Value* v) const {
     std::unordered_set<Node*> ret;
     if (!map_.count(v)) {
       return ret;
     }
 
-    for (auto set : map_.at(v)) {
-      const auto root = find(set);
-      if (!writes_.count(root)) {
-        continue;
-      }
-
-      for (auto write : writes_.at(root)) {
-        ret.insert(write);
-      }
+    // Any write to a wilcard may write to `v`.
+    for (auto writer : wildcardWriters_) {
+      ret.insert(writer);
     }
+
+    const auto root = map_.at(v);
+    root->bfsBothDirections([&](const Element* el) {
+      for (auto writer : el->writers) {
+        ret.insert(writer);
+      }
+      return false; // fn has to return bool but we don't use the result
+    });
     return ret;
   }
 
-  // Returns whether `n` writes to the value `v`
-  bool writesTo(Node* n, const Value* v) const {
-    return getWrites(v).count(n);
+  // Functionally equivalent to getWrites().size() > 0, but with a
+  // short-circuiting implementation to be faster.
+  bool hasWriters(const Value* v) const {
+    if (!map_.count(v)) {
+      return false;
+    }
+
+    if (isWildcard(v)) {
+      // If `n` has a wildcard, any write in the graph may write to it.
+      // So the only way we know there are no writers is if there are no writes
+      // at all.
+      return numWrites_ == 0;
+    }
+
+    if (wildcardWriters_.size() > 0) {
+      // A write to the wildcard may be a write to any value.
+      return true;
+    }
+
+    const auto root = map_.at(v);
+
+    return root->bfsBothDirections(
+        [&](const Element* el) { return el->writers.size() > 0; },
+        /*shortCircuit=*/true);
   }
 
-  // Returns whether there are no writes in the whole graph
-  bool hasNoWrites() const {
-    return !writes_.empty();
+  // Get all nodes that write to a wildcard value.
+  const std::unordered_set<Node*>& getWildcardWriters() const {
+    return wildcardWriters_;
   }
 
-  // Dump the contents of the alias db to stdout in human-readable form
   void dump() const {
-    std::unordered_set<Element*> roots;
-    for (auto& el : sets_) {
-      roots.insert(find(el.get()));
-    }
-
-    size_t setId = 0;
-    for (auto set : roots) {
-      if (wildcardSet_ && set == find(wildcardSet_)) {
-        std::cout << "WILDCARDS: ";
-        dump(set);
-        continue;
-      }
-
-      std::cout << "Set " << setId << ": ";
-      dump(set);
-
-      if (writes_.count(set)) {
-        std::cout << "  Writes:\n";
-        for (auto writer : writes_.at(set)) {
-          std::cout << "    " << *writer;
+    std::cout << "\n===2. ALIAS DB===\n";
+    for (const auto& ptrPair : elements_) {
+      const auto element = ptrPair.first;
+      if (element->pointsTo.size() > 0) {
+        std::cout << element->value->uniqueName() << " points to: ";
+        for (const auto pointedTo : element->pointsTo) {
+          std::cout << pointedTo->value->uniqueName() << ", ";
         }
+        std::cout << "\n";
       }
-
-      setId++;
     }
 
+    std::cout << "\n===3. WILDCARDS===\n";
+    for (const auto wildcard : wildcards_) {
+      std::cout << wildcard->uniqueName() << ", ";
+    }
     std::cout << "\n";
   }
 
  private:
-  // Represents a value's membership in an alias set. This is the "element" of
-  // a union find, so the root element represents the set itself.
+  enum class BfsDirection { POINTS_TO, POINTED_FROM };
+  // `Element` represents the vertex in the points-to graph. It has a 1:1
+  // relationship with IR `Value`s.
   struct Element {
-    const Value* value;
-    // Root entries are their own parent.
-    Element* parent;
-    // Circular linked list contains all elements of the tree rooted at `this`
-    Element* next;
-    // Size of tree rooted at `this`
-    size_t size;
+    const Value* value = nullptr;
+    // All values that this value *may* point to. It's possible to have multiple
+    // values that you might point to due to control flow/complex ops
+    std::unordered_set<Element*> pointsTo;
+    // Backreference to values that point to `this`
+    std::unordered_set<Element*> pointedFrom;
+    // Nodes that write to this specific value.
+    std::unordered_set<Node*> writers;
+
+    // Do a breadth-first search over the graph, starting at `this` and
+    // traversing in the direction `dir`.`fn` will be run on each element.
+    //
+    // If `shortCircuit` is set, then if `fn` evaluates to true the search will
+    // short-circuit and return true. You can use this to do existence checks
+    // on the graph or whatever.
+    template <typename Fn>
+    bool bfs(Fn fn, BfsDirection dir, bool shortCircuit = false) const {
+      std::queue<const Element*> queue;
+      std::unordered_set<const Element*> seen;
+
+      queue.push(this);
+      while (!queue.empty()) {
+        const auto el = queue.front();
+        queue.pop();
+        if (seen.count(el)) {
+          continue;
+        }
+        seen.insert(el);
+
+        if (fn(el) && shortCircuit) {
+          return true;
+        }
+
+        const auto& nextList =
+            dir == BfsDirection::POINTS_TO ? el->pointsTo : el->pointedFrom;
+        for (auto ptr : nextList) {
+          queue.push(ptr);
+        }
+      }
+      return false;
+    }
+
+    // Execute bfs in both directions.
+    //
+    // If `shortCircuit` is set, then it returns the OR of the search in both
+    // directions.
+    template <typename Fn>
+    bool bfsBothDirections(Fn fn, bool shortCircuit = false) const {
+      return this->bfs(fn, BfsDirection::POINTS_TO, shortCircuit) ||
+          this->bfs(fn, BfsDirection::POINTED_FROM, shortCircuit);
+    }
   };
 
-  // Create a new membership element for `v`.
-  Element* makeSet(const Value* v) {
-    auto el = torch::make_unique<Element>();
-    el->value = v;
-    el->parent = el.get();
-    el->next = el.get();
-    el->size = 1;
-
-    auto rawPtr = el.get();
-    sets_.push_back(std::move(el));
-    return rawPtr;
-  }
-
-  Element* find(Element* el) const {
-    JIT_ASSERT(el);
-    while (el->parent != el) {
-      // Path halving to speed up future queries.
-      el->parent = el->parent->parent;
-      el = el->parent;
-    }
-
-    return el;
-  }
-
-  void union_(Element* a, Element* b) {
-    JIT_ASSERT(a);
-    JIT_ASSERT(b);
-    auto aRoot = find(a);
-    auto bRoot = find(b);
-    if (aRoot == bRoot) {
-      // Already in the same set.
-      return;
-    }
-
-    if (aRoot->size < bRoot->size) {
-      // Ensure we're always merging the smaller tree into the bigger one.
-      std::swap(aRoot, bRoot);
-    }
-
-    JIT_ASSERT(bRoot->size <= aRoot->size);
-
-    // Merge the sets and update the size
-    bRoot->parent = aRoot;
-    aRoot->size = aRoot->size + bRoot->size;
-
-    // Merge the next lists
-    std::swap(aRoot->next, bRoot->next);
-
-    // Merge the write lists
-    for (auto writer : writes_[bRoot]) {
-      writes_[aRoot].insert(writer);
-    }
-    writes_.erase(bRoot);
-  }
-
-  void dump(Element* el) const {
-    auto cur = el;
-    const auto end = el;
-
-    // Traverse the next-list and find all the values.
-    std::cout << cur->value->uniqueName();
-    cur = cur->next;
-    while (cur != end) {
-      std::cout << ", " << cur->value->uniqueName();
-      cur = cur->next;
-    }
-
-    std::cout << "\n";
-  }
-
-  // Register membership of value `a` in the given alias set.
-  void registerMembership(const Value* a, Element* set) {
-    const auto aSet = makeSet(a);
-    union_(aSet, set);
-    map_[a].insert(set);
-  }
-
-  // Test whether elements a and b are in the same set.
-  bool isSameSet(Element* a, Element* b) const {
-    return find(a) == find(b);
-  }
-
-  // Owning stoarge for elements
-  std::vector<std::unique_ptr<Element>> sets_;
-  // Mapping values to the alias sets they are in.
-  std::unordered_map<const Value*, std::unordered_set<Element*>> map_;
-  // Mapping of alias sets to the nodes that write to that alias set.
-  std::unordered_map<const Element*, std::unordered_set<Node*>> writes_;
-  // Special set representing wildcard values.
-  // Nullptr means empty (i.e. there are no wildcards in the graph)
-  Element* wildcardSet_ = nullptr;
+  // Structure that owns all the element pointers. It's a map of
+  //  raw pointer -> unique_ptr to facilitate easy queries
+  std::unordered_map<Element*, std::unique_ptr<Element>> elements_;
+  // Index to look up whatever element corresponds to that value.
+  std::unordered_map<const Value*, Element*> map_;
+  // All values that may point to a wildcard value.
+  std::unordered_set<const Value*> wildcards_;
+  // All nodes that write to a wildcard
+  std::unordered_set<Node*> wildcardWriters_;
+  size_t numWrites_ = 0;
 };
 
 AliasDb::~AliasDb() = default;
 
 AliasDb::AliasDb(std::shared_ptr<Graph> graph) : graph_(std::move(graph)) {
-  setTracker_ = torch::make_unique<AliasSetTracker>();
+  aliasTracker_ = torch::make_unique<AliasTracker>();
   analyze(graph_);
 }
 
 // Does `n` use or write to any wildcard aliases?
 bool AliasDb::hasWildcard(const Node* n) const {
   for (const auto input : n->inputs()) {
-    if (setTracker_->isWildcard(input)) {
+    if (aliasTracker_->isWildcard(input)) {
       return true;
     }
   }
 
   for (const auto output : n->outputs()) {
-    if (setTracker_->isWildcard(output)) {
+    if (aliasTracker_->isWildcard(output)) {
       return true;
     }
   }
@@ -350,18 +331,21 @@ bool AliasDb::writesTo(Node* n, const Value* v) const {
     // This is a primitive type
     return false;
   }
-  return setTracker_->writesTo(n, v);
+  return aliasTracker_->writesTo(n, v);
 }
 
 bool AliasDb::hasWriters(const Node* n) const {
-  if (hasWildcard(n)) {
-    // If `n` has a wildcard, any write in the graph may write to it.
-    // So the only way we know there are no writers is if there are no writes
-    // at all.
-    // TODO this needs to get replaced
-    return setTracker_->hasNoWrites();
+  for (const auto input : n->inputs()) {
+    if (aliasTracker_->hasWriters(input)) {
+      return true;
+    }
   }
-  return getWriters(n).size() != 0;
+  for (const auto output : n->outputs()) {
+    if (aliasTracker_->hasWriters(output)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool AliasDb::hasWritersBefore(const Node* n) const {
@@ -408,7 +392,7 @@ bool AliasDb::writesToInputAlias(Node* n) const {
         graph_->inputs().cend(),
         [&](const Value* graphInput) {
           return shouldAnnotate(graphInput) &&
-              setTracker_->isAlias(graphInput, v);
+              aliasTracker_->pointsTo(graphInput, v);
         });
   });
 }
@@ -417,21 +401,15 @@ std::unordered_set<Node*> AliasDb::getWriters(const Node* n) const {
   std::unordered_set<Node*> writers;
 
   for (const auto input : n->inputs()) {
-    for (auto writer : setTracker_->getWrites(input)) {
+    for (auto writer : aliasTracker_->getWrites(input)) {
       writers.insert(writer);
     }
   }
 
   for (const auto output : n->outputs()) {
-    for (auto writer : setTracker_->getWrites(output)) {
+    for (auto writer : aliasTracker_->getWrites(output)) {
       writers.insert(writer);
     }
-  }
-
-  // A write to the wildcard set should be considered a write to `n`
-  const auto& wildcardWriters = setTracker_->getWildcardWriters();
-  for (auto writer : wildcardWriters) {
-    writers.insert(writer);
   }
 
   return writers;
@@ -439,11 +417,11 @@ std::unordered_set<Node*> AliasDb::getWriters(const Node* n) const {
 
 std::unordered_set<const Value*> AliasDb::getAliases(const Value* v) const {
   std::unordered_set<const Value*> ret;
-  if (!setTracker_->contains(v)) {
+  if (!aliasTracker_->contains(v)) {
     return ret;
   }
 
-  return setTracker_->getAliases(v);
+  return aliasTracker_->getAliases(v);
 }
 
 std::unordered_set<const Value*> AliasDb::getWrites(Node* n) const {
@@ -465,8 +443,18 @@ void AliasDb::dump() const {
   std::cout << "\n===1. GRAPH===\n";
   graph_->dump();
 
-  std::cout << "\n===2. ALIAS DB===\n";
-  setTracker_->dump();
+  aliasTracker_->dump();
+}
+
+static void makeAllAlias(
+    const std::vector<Value*> values,
+    AliasTracker& setTracker) {
+  if (values.size() > 0) {
+    setTracker.makeFreshAlias(values[0]);
+  }
+  for (const auto value : values) {
+    setTracker.makeAlias(value, values[0]);
+  }
 }
 
 void AliasDb::analyze(const std::shared_ptr<Graph>& graph) {
@@ -505,20 +493,13 @@ void AliasDb::analyze(const std::shared_ptr<Graph>& graph) {
 
   // 2. Make all partitions alias each other
   for (const auto& pr : listTypes) {
-    auto& values = pr.second;
-    for (const auto value : values) {
-      setTracker_->makeAlias(value, values[0]);
-    }
+    makeAllAlias(pr.second, *aliasTracker_);
   }
   for (const auto& pr : tupleTypes) {
-    auto& values = pr.second;
-    for (const auto value : values) {
-      setTracker_->makeAlias(value, values[0]);
-    }
+    makeAllAlias(pr.second, *aliasTracker_);
   }
-  for (const auto value : tensors) {
-    setTracker_->makeAlias(value, tensors[0]);
-  }
+  makeAllAlias(tensors, *aliasTracker_);
+
   analyze(graph->block());
 }
 
@@ -639,7 +620,7 @@ void AliasDb::analyzeImpl(Node* node) {
 
     // Record writes
     if (formal->isWrite()) {
-      setTracker_->registerWrite(actualValue, node);
+      aliasTracker_->registerWrite(actualValue, node);
     }
   }
 
@@ -663,14 +644,14 @@ void AliasDb::analyzeImpl(Node* node) {
 
     const auto& formalAlias = formal->set();
     if (formal->isWildcard()) {
-      setTracker_->setWildcard(actual);
+      aliasTracker_->setWildcard(actual);
     } else {
       auto toAlias = formalToActual.at(formalAlias);
       addAlias(actual, toAlias);
     }
 
     if (formal->isWrite()) {
-      setTracker_->registerWrite(actual, node);
+      aliasTracker_->registerWrite(actual, node);
     }
   }
 }
@@ -757,7 +738,7 @@ void AliasDb::analyzeCreator(Node* node) {
 // gives up and creates wildcards for everything.
 void AliasDb::analyzeExtractor(Node* node) {
   for (const auto output : node->outputs()) {
-    setTracker_->setWildcard(output);
+    aliasTracker_->setWildcard(output);
   }
 }
 
@@ -791,7 +772,7 @@ bool AliasDb::addAlias(const Value* value, const Value* from) {
     AT_ASSERT(!shouldAnnotate(from));
     return false;
   }
-  return setTracker_->makeAlias(value, from);
+  return aliasTracker_->makeAlias(value, from);
 }
 
 void AliasDb::mapAliases(at::ArrayRef<Value*> to, at::ArrayRef<Value*> from) {
@@ -806,13 +787,13 @@ void AliasDb::giveFreshAlias(const Value* value) {
     return;
   }
 
-  if (setTracker_->contains(value)) {
+  if (aliasTracker_->contains(value)) {
     // Inside a loop, we may have given a fresh alias to this value already, so
     // skip
     return;
   }
 
-  setTracker_->makeFreshAlias(value);
+  aliasTracker_->makeFreshAlias(value);
 }
 
 bool AliasDb::moveAfterTopologicallyValid(Node* n, Node* movePoint) {
